@@ -1,0 +1,71 @@
+/*!
+* \page callbacks Server Application Callbacks
+*
+* Server-side application logic is implemented by the user in a class that is passed to the template parameter of TCPServer. Pointers to member functions
+* are passed in the constructor and are called when a packet of an appropriate type is dequeued from the completion port queue.
+* Accept, close, receive, and send callbacks are always called with valid, non-null pointer arguments.
+* This is not true of error callbacks, see "Error Notification" below.
+*
+* All callbacks operate on objects of type Connection::Packet, which may be allocated from the server's heap or constructed by the application
+* in a separate location. Only accepting packets are always allocated on the server heap (see "New Connections" below).
+* The server heap is used to allocate connection objects as well as accepting packets, so an appropriate initial heap size
+* should be specified in the TCPServer constructor if the application will be allocating all packets from the server.
+* <B>The application is responsible for discarding all packets, including the one allocated for new connections, to avoid memory leaks.</B>
+* The server never discards packets that appear in an application callback, so it is up to the application to manage the lifecycle of packets.
+*
+* Applications that want to use their own buffers should specify 0 length to avoid allocating memory on the server heap. Then, wsabuf.buf
+* can be set to the buffer location. However, if a partial send occurs, Connection::Packet::size will be 0 and unavailable to record the
+* original buffer size which may need to be known in subsequent sends. Alternatively, the application may reserve its own memory, and construct
+* instances of Connection::Packet in place (placement new) to set the length to a meaningful value as well as use separate data buffers. To take advantage of
+* the asynchronous high-performance nature of IO completion ports, applications can pre-allocate many packets in a similar manner to initiate
+* multiple outstanding operations at once. Applications must still use TCPServer::discardPacket intially, to deallocate the accepting packet from the
+* server heap. Connection::Packet::ptr can then be used with custom values to differentiate between packets allocated on the server heap and those
+* managed by the application.
+*
+* <B>Application callbacks must never initiate multiple simultaneous operations on a single packet nor discard a packet with an outstanding operation.</B>
+* Once a single operation is initiated on a packet, the packet must remain valid and must not be used or modified again until it next appears in a completion callback.
+*
+* \section Receiving and Sending
+* The read procedure is commonly used to send data back in response to a client, or may post additional receive operations as necessary.
+* The write procedure can be used to check errors on a send operation and should post receive operations to continue reading from the client.
+* The implementer should be aware of a send that completes with only part of the specified buffer and handle this in a manner suitable for the applicaiton.
+*
+* \section New Connections
+* Applications will be notified of a newly accepted connection within their accept callback. At this stage, the connection has been established
+* and is ready for IO to be initiated. <B>It is the responsibility of the implementer to call Connection::receive() or Connection::send() within callbacks,
+* including on notification of a new connection, so the connection will behave properly.</B> Doing so is necessary for IO completion packets to be queued.
+* The server does not initiate transfer so the implementer may establish a one-way relationship between servers and clients,
+* even though the underlying protocol, i.e. TCP, will send data both ways regardless.
+*
+* Since accepting connections is managed by TCPServer, the initial packet used in accepting the connection, which is passed to the callback, is always
+* allocated on the server's heap. The application may use this packet for the lifecycle of the connection, and the packet's size is specified determined in 
+* ServerConfig::acceptPacketSize. If the application intends to use other packets, it may discard the accept packet in the accept callback, but must do so
+* using TCPServer::discardPacket.
+*
+* \section Terminated Connections
+* When the callback for connection closure is called, the connection object (and underlying socket) is still valid but the connection has been
+* shutdown. Attempting additional IO will result in an error, so applications should not initiate IO on a connection for which they have
+* received a close notification. Applications must always delete the packet specified in the close callback since it is an outstanding read operation.
+* The close callback is also the last opportunity (aside from error notifications) applications have to discard packets that have been used.
+*
+* \section Error Notification
+* Since completion ports are an asynchronous mechanism, errors may be reported well after initiation of an IO operation. To facilitate reporting of
+* error conditions to the server application, an error callback is required. In this case, the fourth (DWORD) parameter of the callback will always contain
+* the result of WSAGetLastError() with respect to the network function that failed. However, the client and packet pointers cannot be guaranteed to be valid,
+* and the application must verify that they are not null before dereferencing them. In the particular circumstance of a failed accept operation
+* (e.g. AcceptEx fails asynchronously), since no valid connection exists, the connection pointer will be null.
+*
+* For errors on sending and receiving, the application may do as it sees fit with the packet. It may reuse the packet or
+* discard it and terminate the connection. If an error occurs while accepting, the application <B>must</B> discard the packet
+* and cannot attempt IO. When an error occurs while closing a connection, the socket will be forcibly closed, so the application
+* <B>must</B> discard the packet and should not attempt any additional IO. Error callbacks should check for WSA_OPERATION_ABORTED
+* as the error code after to discard outstanding packets (such as after a connection has been terminated).
+*
+* Only outstanding operations that have failed asynchronously and all errors during internal server operations (such as posting new accepting sockets)
+* are reported in the manner described above. When calling Connection::receive and Connection::send, synchronous errors are reported by return value.
+* Application callbacks should check for return values that are significant to the application. Note that unlike WSARecv() or WSASend(),
+* the value of WSAGetLastError() is captured and returned in case of failure, though synchronous completion is still indicated by zero.
+* <B>Applications are responsible for deallocating packets on synchronous failure of an IO operation.</B>
+*
+* \see TCPServer::Procedure, Connection::receive(), Connection::send()
+*/
