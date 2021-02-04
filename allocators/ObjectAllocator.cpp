@@ -1,4 +1,4 @@
-#include "util.h"
+#include "../util.h"
 #include "ObjectAllocator.h"
 
 //========================================================================
@@ -14,6 +14,9 @@ Hydra::Depot::Depot(
                           Hydra::static_info.sys.dwPageSize)
                 >> Hydra::static_info.page_shift }
 {
+    _ASSERT_EXPR(alloc_const > 0,
+        L"Depot::Depot(): alloc_const must be greater than zero");
+
     magazines = new RawSlabCache{
         sizeof(void*) * (mag_size + 1),
         align,

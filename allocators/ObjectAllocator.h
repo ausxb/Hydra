@@ -37,7 +37,7 @@ namespace Hydra
                          list_ref;
 
         /*!
-         * \brief Construct a new depot with it's own magzine allocator.
+         * \brief Construct a new depot with its own magzine allocator.
          *
          * The last entry of a magazine is its full/empty list linkage, so the
          * object size for the slab cache is set to size + 1. As mentioned in
@@ -91,6 +91,17 @@ namespace Hydra
          *         be made. Null otherwise.
          */
         void *newEmpty();
+
+        /*!
+         * \brief Return an empty magazine to the depot's slab allocator.
+         *
+         * Since the slab allocator is serialized holding depot->lock is
+         * optional.
+         *
+         * \param[in] mag A pointer to an empty magazine that was allocated
+         *                through newEmpty on this depot.
+         */
+        void deleteEmpty(void *mag);
 
         /*!
          * \brief Get an empty magazine from the empty list.
@@ -168,9 +179,13 @@ namespace Hydra
      * most up to date (largest size) depot, then it will attempt creating a
      * new depot unless the magazine expansion limit has been reached.
      *
-     * \tparam T
-     * \tparam S
-     * \tparam N
+     * \tparam T The type of object being cached through this allocator.
+     * \tparam S The slab allocator type. One of RawSlabCache or
+     *           EmbeddedSlabCache.
+     * \tparam N The cache line size, in bytes, to optimize for. Necessarily
+     *           a power of two. Weird things happen if less than the size
+     *           of a pointer (I doubt C++ would be operable on such an
+     *           architecture).
      */
     template<typename T, typename S, unsigned N>
     class ObjectAllocator
@@ -184,6 +199,59 @@ namespace Hydra
         static_assert((N & (N - 1)) == 0, "Template parameter N, the cache "
             "line size, is not a power of two");
 
+        /*!
+         * \brief Construct a new object allocator.
+         *
+         * \throws std::runtime_error If the object allocator cannot be
+         *     intialized to a valid state, including because of invalid
+         *     arguments, this is reported through an exception.
+         *
+         * Magazine sizes are exposed to clients in units of the number of
+         * pointers per cache line, specifically N / sizeof(void*). The number
+         * of available entries in a magazine will be one less than the
+         * implied size, because the last entry serves as free-list linkage
+         * for the sake of alignment. See details in Depot::Depot().
+         *
+         * The time determined by contention_thresh in seconds is equal to
+         * its value multiplied by the inverse of the value retrieved by
+         * QueryPerformanceFrequency(). A smaller value makes magazine growth
+         * more likely, and a larger value makes magazine growth less likely.
+         * But of course, "likely" is determined completely by application
+         * behavior. The magazine size is increased when the time since a
+         * thread last waited on the same depot lock is less than or equal to
+         * the time determined by contention_thresh.
+         *
+         * C++ doesn't allow constructors to be variadic templates (AFAIK)
+         * so unlike ObjectAllocator::alloc(), functionality must be passed
+         * via a closure to allow construction during initialization, and any
+         * parameters must be predetermined, or otherwise "baked into"
+         * the closure. Note that destructors can be called at any time
+         * on objects that have already been constructed in place.
+         *
+         * \param[in] thread_caches The number of independent magazine caches
+         *                          to create. Should be the number of threads
+         *                          making concurrent allocations.
+         * \param[in] mag_init The initial size of all magazines, interpreted
+         *                     as a multiplier for the number of pointers that
+         *                     fit in a cache line. Exact value will be
+         *                     mag_init * (N / sizeof(void*)) - 1.
+         * \param[in] mag_max A cap on magazine sizes, so that that contention
+         *                    relaxation mechanism doesn't get out of hand.
+         *                    Actual value will be one less than implied as
+         *                    described above.
+         * \param[in] mag_alloc_const This is a parameter for dynamically
+         *                            adjusting the slab cache size inside a
+         *                            depot as the magazine size grows. See
+         *                            the explanation in Depot::Depot().
+         * \param[in] contention_thresh This value is used to monitor depot
+         *                              contention. Interpreted in units of the
+         *                              performance counter's resolution. See
+         *                              the explanation above.
+         * \param[in] obj_init A C++ function that is used to construct objects
+         *                     that are used to pre-fill the magazines during
+         *                     the allocator's initialization. Must construct
+         *                     the object in place on the given pointer.
+         */
         ObjectAllocator(
             unsigned thread_caches,
             unsigned mag_init,
@@ -196,10 +264,17 @@ namespace Hydra
         /*!
          * \brief Constructor with the additional slab_pages for RawSlabCache.
          *
+         * \throws std::runtime_exception In same situations as described
+         *     in the other constructor.
+         *
          * All other parameters are the same as in the constructor without
          * slab_pages. This overload is used for the specilization when
          * RawSlabCache is used, and attempting to use this constructor will
          * fail when using EmbeddedSlabCache.
+         *
+         * \param[in] slab_pages This is passed verbatim to
+         *                       RawSlabCache::RawSlabCache() as the same
+         *                       parameter.
          */
         ObjectAllocator(
             unsigned thread_caches,
@@ -211,6 +286,24 @@ namespace Hydra
             const std::function<void(void*)> &obj_init
         );
 
+        /*!
+         * \brief Destructs all cached objects and cleans up depots.
+         *
+         * For reference, the resources that must be released are:
+         *   1. Depot structures
+         *   2. Magazine arrays, held by
+         *      - Thread caches
+         *      - Depot free lists
+         *   3. Cached objects, held in
+         *      - Thread cache magazines
+         *      - Depot full lists
+         *   4. Raw slab cache held by depot struct, handled by
+         *      depot destructor
+         *   5. The array of thread caches
+         *   6. Locks
+         *      - list_lock
+         *      - Depot locks, handled by depot destructor
+         */
         ~ObjectAllocator();
 
         /*!
@@ -284,9 +377,9 @@ namespace Hydra
          * \param[in] mc        A pointer to the MagazineCache making the
          *                      request to drop into the depot layer.
          * \param[in] alloc_req True if the invocation is being made as
-         *                       part of an object allocation request. False
-         *                       if the invocation is part of an object
-         *                       deallocation request.
+         *                      part of an object allocation request. False
+         *                      if the invocation is part of an object
+         *                      deallocation request.
          *
          * \return True if a magazine was available. False if no magazine
          *         was available.
@@ -314,7 +407,7 @@ namespace Hydra
          *   1. If we can set up the new depot <b>and</b> service the request,
          *      we set serviced to true and return true. This implementation
          *      deviates from the original Bonwick, Adams '01 paper in that
-         *      both pointers (instead of only prev) are set to empty
+         *      both pointers (instead of only loaded) are set to empty
          *      magazines for dealloc. This is needed when switching depots
          *      to ensure that the same depot is in use for both pointers.
          *   2. If we can set up the new depot <b>but</b> we cannot service the
@@ -364,12 +457,45 @@ namespace Hydra
          */
         void discard_full(Depot *depot);
 
+        /*!
+         * \brief Attempt to initialize a thread cache's magazines using the
+         *        inital depot.
+         *
+         * This function tries allocating two magazines for mc from the first
+         * depot set up on construction, throwing an error if this cannot
+         * be done. It then allocates memory for objects from the backing
+         * store and passes the point to obj_init. If allocating an object's
+         * memory fails, then the cache will be only partially filled (or
+         * possibly empty) but will be in a valid state, and so no error will
+         * be reported.
+         *
+         * \param[in] mc A pointer to a thread cache being initialized.
+         * \param[in] init A pointer to the initial depot.
+         * \param[in] obj_init A const reference to an std::function taking
+         *                     a void pointer as its only argument. This
+         *                     function must construct/initalize the memory
+         *                     passed as the argument to an object of the type
+         *                     specified for this ObjectAllocator.
+         */
         void init_magazine_cache(
             MagazineCache *mc,
             Depot *init,
             const std::function<void(void*)> &obj_init
         );
 
+        /*!
+         * \brief Destroy and release any objects in the magazines.
+         *
+         * To assist with deinitializing thread caches, the destructor is
+         * called on any valid references to objects contained in the
+         * magazines before releasing the underlying memory to the backing
+         * store. This call is designed to handle partially filled magazines
+         * that are active in a cache, in contrast with full magazines in a
+         * depot list which are all released at once through
+         * ObjectAllocator::discard_full().
+         *
+         * \param[in] mc A pointer to a thread cache being deinitialized.
+         */
         void deinit_magazine_cache(MagazineCache *mc) noexcept;
 
         MagazineCache *magazine_cache;
@@ -431,9 +557,25 @@ namespace Hydra
         /* Set up first depot and init empty magazines */
         Depot *init = new Depot{ top_magsize, N, mag_const };
 
-        for (unsigned i = 0; i < thread_caches; i++)
+        unsigned i = 0;
+        try
         {
-            init_magazine_cache(magazine_cache + i, init, obj_init);
+            for ( ; i < thread_caches; i++)
+            {
+                init_magazine_cache(magazine_cache + i, init, obj_init);
+            }
+        }
+        catch(const std::runtime_error &err)
+        {
+            /* Destructor will not run. Roll back any allocations with
+               object destructor. */
+            for ( ; i > 0; i--)
+            {
+                deinit_magazine_cache(magazine_cache + i - 1);
+            }
+            delete init;
+            _aligned_free(magazine_cache);
+            throw err;
         }
 
         depot_list.push_front(init);
@@ -491,9 +633,25 @@ namespace Hydra
         /* Set up first depot and init empty magazines */
         Depot *init = new Depot{ top_magsize, N, mag_const };
 
-        for (unsigned i = 0; i < thread_caches; i++)
+        unsigned i = 0;
+        try
         {
-            init_magazine_cache(magazine_cache + i, init, obj_init);
+            for ( ; i < thread_caches; i++)
+            {
+                init_magazine_cache(magazine_cache + i, init, obj_init);
+            }
+        }
+        catch(const std::runtime_error &err)
+        {
+            /* Destructor will not run. Roll back any allocations with
+               object destructor. */
+            for ( ; i > 0; i--)
+            {
+                deinit_magazine_cache(magazine_cache + i - 1);
+            }
+            delete init;
+            _aligned_free(magazine_cache);
+            throw err;
         }
 
         depot_list.push_front(init);
@@ -630,79 +788,82 @@ namespace Hydra
 
             EnterCriticalSection(&mc->depot->lock);
         }
+        else
+        {
+            // Check if this is the last thread AND NOT on the largest depot
+            // and add an entry mechanism to the if block below
+        }
 
-        /* Lock contention is beyond the specified threshold,
-           switch depots */
+        /* Lock contention is within the specified threshold. There are
+           essentially three subcases for a thread that waited on a depot
+           lock. If the magazine size is equal to top_magsize, this thread
+           is using the largest depot and is the first to acquire the conteded
+           lock (that was within qpc_threshold). In this case, a new depot is
+           in order. If the thread is the last using a depot, it should move
+           to the largest depot and destroy the old one. Otherwise, the thread
+           can simply attempt migrating to the largest depot. */
         if (current_qpc != -1
             && current_qpc - mc->last_qpc <= threshold_qpc)
         {
-            /* We preserve the refcount until switching to the new depot
-               is successful. Otherwise, we could fail with some other
-               thread having deleted the depot in the meantime. */
-            unsigned ref_count = mc->depot->ref_count;
-
+            /* A thread may not hold a depot lock while acquiring list_lock.
+               Otherwise, if multiple threads are switching between different
+               depots simultaneously, deadlock may occur in the critical
+               section below. */
             LeaveCriticalSection(&mc->depot->lock);
 
             Depot *top_depot = nullptr;
             bool depot_ok = true;
             unsigned depot_pages;
 
-            if (ref_count == 1)
+            EnterCriticalSection(&list_lock);
+            if (mc->depot->mag_size == top_magsize)
             {
-                /* Although it would be nice to be outside the lock while
-                   allocating a new depot, if someone is destroying another
-                   depot and sees that top_magsize as set here is already
-                   larger than their mag_size, then they will attempt to grab
-                   the new depot which is yet to be constructed. They will
-                   instead get this one which is about to be destroyed, so
-                   the addition of the new depot has to be atomic anyway. */
-                EnterCriticalSection(&list_lock);
-                if (mc->depot->mag_size == top_magsize)
+                top_magsize += N / sizeof(void*);
+
+                /* To do: add another slab allocator for the depot, and
+                   attempt in place construction */
+                try
                 {
-                    top_magsize += N;
-
-                    try
-                    {
-                        top_depot = new Depot{ top_magsize, N, mag_const };
-                    }
-                    catch(const std::exception &e)
-                    {
-                        /* Clients should not use exception handling for
-                           allocations. Failure is indicated by returning
-                           NULL. top_depot will still be nullptr, so we will
-                           continue down the failure path below */
-                    }
-
-                    /* If we couldn't get a new depot, roll back
-                       and continue using the current one */
-                    if (top_depot)
-                    {
-                        depot_list.push_front(top_depot);
-                        top_depot->list_ref = depot_list.begin();
-                        top_depot->ref_count = 1;
-                        depot_list.erase(mc->depot->list_ref);
-                    }
-                    else
-                    {
-                        top_magsize -= N;
-                        depot_ok = false;
-                    }
+                    top_depot = new Depot{ top_magsize, N, mag_const };
                 }
-                LeaveCriticalSection(&list_lock);
-            }
+                catch(const std::exception &e)
+                {
+                    /* Clients should not use exception handling for
+                       allocations. Failure is indicated by returning
+                       NULL. top_depot will still be nullptr, so we will
+                       continue down the failure path below */
+                }
 
-            /*  */
+                /* If we couldn't get a new depot, roll back
+                   and continue using the current one */
+                if (top_depot)
+                {
+                    depot_list.push_front(top_depot);
+                    top_depot->list_ref = depot_list.begin();
+                    top_depot->ref_count = 1;
+                }
+                else
+                {
+                    top_magsize -= N / sizeof(void*);
+                    depot_ok = false;
+                }
+            }
+            else
+            {
+                top_depot = depot_list.front();
+
+                /* This ensures top_depot won't be deleted by the time
+                   we attempt to use it below */
+                EnterCriticalSection(&top_depot->lock);
+                top_depot->ref_count++;
+                EnterCriticalSection(&top_depot->lock);
+            }
+            LeaveCriticalSection(&list_lock);
+
+            /* depot_ok is true if either a new depot was successfully
+               allocated or no allocation was attempted */
             if (depot_ok)
             {
-                /* Get the largest sized depot, unless we set it up a
-                   moment ago. */
-                if (!top_depot)
-                {
-                    EnterCriticalSection(&list_lock);
-                    top_depot = depot_list.front();
-                    LeaveCriticalSection(&list_lock);
-                }
-
                 /* Attempt using the new depot to service the request. mc's
                    magazine pointers still point into the old depot, and we
                    want to keep them there until we know that, at the very
@@ -715,25 +876,46 @@ namespace Hydra
 
                 if (switch_ok)
                 {
-                    if (ref_count == 1)
+                    EnterCriticalSection(&mc->depot->lock);
+                    if (mc->depot->ref_count == 1)
                     {
+                        /* A thread cannot select this depot and increment the
+                           reference count between the time we release this
+                           lock and delete below. At this point, a larger depot
+                           has already been created, so other threads that have
+                           not yet checked depot_list will get the larger depot
+                           when they do. If a thread previously had selected
+                           this depot by the time we arrive here, then the
+                           reference count isn't one. */
+                        LeaveCriticalSection(&mc->depot->lock);
+
                         /* Since we will be destroying all magazine arrays,
                            deleting the magazine allocator suffices as long as
                            all objects on the full list have been returned to
                            their original slab allocator. */
                         discard_full(mc->depot);
 
+                        EnterCriticalSection(&list_lock);
+                        depot_list.erase(mc->depot->list_ref);
+                        LeaveCriticalSection(&list_lock);
+
                         delete mc->depot;
                     }
                     else
                     {
-                        EnterCriticalSection(&mc->depot->lock);
                         mc->depot->ref_count--;
                         LeaveCriticalSection(&mc->depot->lock);
                     }
 
                     mc->depot = top_depot;
                     mc->mag_size = top_depot->mag_size;
+                }
+                else
+                {
+                    /* The switch will not occur, so release our hold */
+                    EnterCriticalSection(&top_depot->lock);
+                    top_depot->ref_count--;
+                    EnterCriticalSection(&top_depot->lock);
                 }
             }
 
@@ -894,6 +1076,11 @@ namespace Hydra
                 backing_store.dealloc(*discard);
             }
 
+            /* It would be cleanest to have depot->deleteEmpty(discard)
+               here, but discard_full is only used prior to depot destruction
+               which includes destruction of the underlying RawSlabCache.
+               So it is faster to not individually discard magazines but
+               to let the entire allocator be wiped. */
             discard = static_cast<T**>(depot->getFull());
         }
     }
@@ -962,14 +1149,20 @@ namespace Hydra
         MagazineCache *mc
     ) noexcept
     {
+        T *del;
+
         while (mc->loaded_cnt > 0)
         {
-            backing_store.dealloc(mc->loaded[--mc->loaded_cnt]);
+            del = mc->loaded[--mc->loaded_cnt];
+            del->~T();
+            backing_store.dealloc(del);
         }
 
         while (mc->prev_cnt > 0)
         {
-            backing_store.dealloc(mc->prev[--mc->prev_cnt]);
+            del = mc->prev[--mc->prev_cnt];
+            del->~T();
+            backing_store.dealloc(del);
         }
     }
 
@@ -979,6 +1172,11 @@ namespace Hydra
     inline void *Depot::newEmpty()
     {
         return magazines->alloc();
+    }
+
+    inline void Depot::deleteEmpty(void *mag)
+    {
+        magazines->dealloc(mag);
     }
 
     inline void *Depot::getEmpty()
