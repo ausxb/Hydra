@@ -1,378 +1,517 @@
-template<class A>
-Hydra::TCPServer<A>::TCPServer(
-	A& application,
-	typename TCPServer<A>::Procedure readproc,
-	typename TCPServer<A>::Procedure writeproc,
-	typename TCPServer<A>::Procedure acceptproc,
-	typename TCPServer<A>::Procedure closeproc,
-	typename TCPServer<A>::Procedure errorproc,
-	const Hydra::ServerConfig& config
-) : refApp{ application }, pmfnReadProc{ readproc }, pmfnWriteProc{ writeproc },
-pmfnAcceptProc{ acceptproc }, pmfnCloseProc{ closeproc },
-pmfnErrorProc{ errorproc }, mConfig{ config },
-mSocket{ INVALID_SOCKET }, mAcceptCount{ 0 },
-hCompPort{ INVALID_HANDLE_VALUE }, hWorkers{ config.initWorkers },
-bRunning{ false }, dwBarrierCount{ 0 },
-hServerHeap{ INVALID_HANDLE_VALUE }
+#include "TCP.h"
+
+#include "Connection.h"
+#include "Packet.h"
+#include "Logger.h"
+#include "util.h"
+
+Hydra::TCP::TCP(unsigned initWorkers, unsigned long shutdownTimeoutMs) :
+	fnAcceptEx{ nullptr },
+	connection_cache{ sizeof(Connection), alignof(Connection), 1 },
+	hCompPort{ INVALID_HANDLE_VALUE },
+	hWorkers{ initWorkers },
+	dwBarrierCount{ 0 }
 {
-	if (readproc == nullptr || writeproc == nullptr ||
-		acceptproc == nullptr || closeproc == nullptr || errorproc == nullptr)
-		throw ServerException{ "TCPServer::TCPServer(): All callbacks must be valid", 0 };
+	_ASSERT_EXPR(initWorkers > 0, L"TCP::TCP(): There must be at least a single thread");
 
-	if (mConfig.initWorkers == 0)
-		throw ServerException{ "TCPServer::TCPServer(): There must be at least a single thread", 0 };
+	setupCompletionPort();
+	launchWorkers();
+}
 
-	if (mConfig.backlog == 0)
-		throw ServerException{ "TCPServer::TCPServer(): The backlog size must be greater than zero", 0 };
+Hydra::TCP::~TCP()
+{
+	shutdown();
+	terminateWorkers();
+	cleanupCompletionPort();
+}
 
-	if (mConfig.heapSize == 0)
-		throw ServerException{ "TCPServer::TCPServer(): The packet heap must be of a reasonable size", 0 };
+void Hydra::TCP::shutdown()
+{
+	globalLog.dbg("Shutdown phase 1");
 
-	hServerHeap = HeapCreate(0, mConfig.heapSize, 0);
-	if (!hServerHeap)
+	/* Phase 1: forcibly close all sockets */
+	for (OpenPort &port : mOpenPorts)
 	{
-		int e = GetLastError();
-		throwWithError<ServerException>("TCPServer::TCPServer(): unable to create packet heap", e);
+		port.closing = true;
+
+		closesocket(port.mSocket);
+
+		std::unique_lock<std::mutex> lock{ port.controlMutex };
+
+		std::list<Connection*>::iterator iter = port.connections.begin();
+		std::list<Connection*>::iterator fwd;
+
+		while (iter != port.connections.end())
+		{
+			fwd = std::next(iter);
+			closesocket((*iter)->mSocket);
+			/* See comment at this point in the code in TCP::close() below */
+			if ((*iter)->outstanding.load(std::memory_order_relaxed) == 0)
+			{
+				Connection *term = *iter;
+				term->~Connection();
+				connection_cache.dealloc(term);
+				port.connections.erase(iter);
+			}
+			iter = fwd;
+		}
 	}
-}
 
-template<class A>
-Hydra::TCPServer<A>::~TCPServer()
-{
-	stop();
-	HeapDestroy(hServerHeap);
-}
+	globalLog.dbg("Shutdown phase 2");
 
-template<class A>
-void Hydra::TCPServer<A>::start()
-{
-	if (bRunning.exchange(true) == false)
+	/* Phase 2: wait for active connections to release their resources */
+	for (OpenPort &port : mOpenPorts)
 	{
-		setupCompletionPort();
-		acquireSocket();
-		launchWorkers();
-		postInitialAccepts();
+		std::unique_lock<std::mutex> lock{ port.controlMutex };
+		while (!port.connections.empty())
+		{
+			port.connectionsClosedCond.wait(lock);
+		}
 	}
-}
 
-template<class A>
-void Hydra::TCPServer<A>::stop()
-{
-	if (bRunning.exchange(false) == true)
+	globalLog.dbg("Shutdown phase 3");
+
+	/* Phase 3: wait for outstanding accepts to be cancelled */
+	for (OpenPort &port : mOpenPorts)
 	{
-		releaseSocket();
-		terminateWorkers();
-		cleanupCompletionPort();
+		std::unique_lock<std::mutex> lock{ port.controlMutex };
+		while (port.acceptCount.load(std::memory_order_relaxed) > 0)
+		{
+			port.acceptsCancelledCond.wait(lock);
+		}
 	}
+
+	globalLog.dbg("Shutdown phase 4");
+
+	/* Phase 4: release resources */
+	mOpenPorts.clear();
 }
 
-template<class A>
-Hydra::Connection::Packet* Hydra::TCPServer<A>::acquirePacket(Connection::Packet::Operation op, ULONG length, PVOID context) const
+Hydra::TCP::OpenPort& Hydra::TCP::listen(PCSTR bind, PCSTR port, UINT backlog)
 {
-	// Windows' heaps are serialized
-	CHAR* mem = reinterpret_cast<CHAR*>(HeapAlloc(hServerHeap, 0, sizeof(Connection::Packet) + length));
-	
-	//std::cout << "[ALLOC] Packet at " << (void*)mem << std::endl; 
+	_ASSERT_EXPR(backlog > 0, "TCP::listen(): The backlog size must be greater than zero");
 
-	if (!mem) return nullptr; // Should threaded exceptions be used?
+	SOCKET s = acquireSocket(true, bind, port, backlog);
 
-	return new(mem) Connection::Packet{ op, length, mem + sizeof(Connection::Packet), context };
+	// OpenPort *port = new OpenPort{ s };
+	mOpenPorts.emplace_front(s, hCompPort);
+	mOpenPorts.front().linkage = mOpenPorts.begin();
+	return mOpenPorts.front();
 }
 
-template<class A>
-void Hydra::TCPServer<A>::discardPacket(Connection::Packet* packet) const
+void Hydra::TCP::close(OpenPort &port)
 {
-	//std::cout << "[DEALLOC] Packet at " << packet << std::endl;
-	packet->~Packet();
-	HeapFree(hServerHeap, 0, packet);
+	port.closing = true;
+
+	closesocket(port.mSocket);
+
+	std::unique_lock<std::mutex> lock{ port.controlMutex };
+
+	std::list<Connection*>::iterator iter = port.connections.begin();
+	std::list<Connection*>::iterator fwd;
+
+	/* Phase 1: forcibly close all sockets */
+	while (iter != port.connections.end())
+	{
+		fwd = std::next(iter);
+		closesocket((*iter)->mSocket);
+		/* This check is used to avoid deleting a connection twice. Once closing is set,
+           worker threads will delete clients when the last completion arrives and before
+		   decrementing their outstanding operation counter, so the client isn't deleted
+		   below. Zero will be observed only if the application has not submitted new work,
+		   meaning the connection is idle (even if the remote end is sending data) since
+		   no completion packets will be queued. Relaxed semantics are sufficient for this. */
+		if ((*iter)->outstanding.load(std::memory_order_relaxed) == 0)
+		{
+			Connection *term = *iter;
+			term->~Connection();
+			connection_cache.dealloc(term);
+			port.connections.erase(iter);
+		}
+		iter = fwd;
+	}
+
+	/* Phase 2: wait for active connections to release their resources */
+	while (!port.connections.empty())
+	{
+		port.connectionsClosedCond.wait(lock);
+	}
+
+	/* Phase 3: wait for outstanding accepts to be cancelled */
+	while (port.acceptCount.load(std::memory_order_relaxed) > 0)
+	{
+		port.acceptsCancelledCond.wait(lock);
+	}
+
+	/* Phase 4: now that all dependencies are cleaned up, destroy the port */
+	mOpenPorts.erase(port.linkage);
 }
 
-template<class A>
-void Hydra::TCPServer<A>::workerLoop()
+/*
+Hydra::Connection& Hydra::TCP::connect(PCSTR addr, PCSTR port)
 {
-	Connection* client = nullptr;
-	Connection::Packet* io = nullptr;
+
+}
+
+void Hydra::TCP::disconnect(Connection &connection)
+{
+
+}
+*/
+
+void Hydra::TCP::workerLoop(unsigned id)
+{
+	Connection* remote = nullptr;
+	Packet* io = nullptr;
 	DWORD bytes = 0;
 	DWORD timeout = INFINITE;
+
+	globalLog.dbg("Thread " + std::to_string(id) + " startup");
 
 	while(true)
 	{
 		BOOL status = GetQueuedCompletionStatus(
 			hCompPort,
 			&bytes,
-			reinterpret_cast<PULONG_PTR>(&client),
+			reinterpret_cast<PULONG_PTR>(&remote),
 			reinterpret_cast<LPOVERLAPPED*>(&io),
 			timeout
 		);
 
-		if (status && io == &shutdown_packet) // Terminate thread
+		bool shutdown_aware_decrement = false;
+
+		if (status && io == &terminate_packet) /* Terminate thread */
 		{
 			break;
 		}
-		else if (!status) // Handle error
+		else if (!status) /* Handle async error */
 		{
-			int e = WSAGetLastError();
-			Connection::Packet::Operation op_err = Connection::Packet::EXCEPTIONAL;
+			int wsa_error = WSAGetLastError();
+			Packet::Operation op_err = Packet::Operation::internal_exception;
 
-			// To handle when GetQueuedCompletionStatus gives NULL for lpOverlapped
+			/* If lpOverlapped is NULL, dereferencing it is a bad idea */
 			if (io) op_err = io->op;
 
 			switch (op_err)
 			{
-			case Connection::Packet::Operation::READ:
-			case Connection::Packet::Operation::WRITE:
-				--client->mOutstanding;
-				(refApp.*pmfnErrorProc)(this, client, io, e);
-				break;
-
-			case Connection::Packet::Operation::ACCEPT:
+			case Packet::Operation::server_read:
+			case Packet::Operation::server_write:
 			{
-				SOCKET newsock = reinterpret_cast<SOCKET>(io->ptr);
+				async_error(*remote->port, remote, io, wsa_error);
 
-				BOOL status = FALSE;
-				int err = 0;
-				if (bRunning.load() == true)
-				{
-					status = fnAcceptEx(mSocket,
-						newsock,
-						mAcceptExBuffer,
-						0,
-						sizeof(sockaddr_in) + 16,
-						sizeof(sockaddr_in) + 16,
-						&mAcceptExBytes,
-						reinterpret_cast<LPOVERLAPPED>(io));
-
-					if (!status) err = WSAGetLastError();
-				}
-
-				// Either AcceptEx failed synchronously or the conditions for re-posting are not met
-				if(!status && err != WSA_IO_PENDING)
-				{
-					io->ptr = nullptr;
-					// If accepting on a socket fails, there is no valid connection, indicated by nullptr
-					(refApp.*pmfnErrorProc)(this, nullptr, io, e);
-
-					mAcceptMutex.lock();
-					mPostedAccepts.erase(newsock);
-					mAcceptMutex.unlock();
-					closesocket(newsock);
-				}
+				// remote->outstanding.fetch_sub(1, std::memory_order_relaxed);
+				shutdown_aware_decrement = true;
 
 				break;
 			}
 
-			case Connection::Packet::Operation::CLOSE:
-				(refApp.*pmfnErrorProc)(this, client, io, e);
+			case Packet::Operation::server_accept:
+			{
+				remote = static_cast<Connection*>(io->internal);
 
-				mConnectionsMutex.lock();
-				mConnections.erase(client);
-				mConnectionsMutex.unlock();
+				closesocket(remote->mSocket);
 
-				closesocket(client->mSocket); // Close socket unconditionally
-				client->~Connection();
-				HeapFree(hServerHeap, 0, client);
+				/* If accepting on a socket fails, there is no valid connection,
+				   indicated by nullptr */
+				async_error(*remote->port, nullptr, io, wsa_error);
 
+				/* Atomic decrement, and if last, notify the port in case it is waiting */
+				if (remote->port->acceptCount
+						.fetch_sub(1, std::memory_order_relaxed) == 1)
+				{
+					remote->port->acceptsCancelledCond.notify_one();
+				}
+
+				remote->~Connection();
+				connection_cache.dealloc(remote);
+
+				break;
+			}
+
+			case Packet::Operation::server_close:
+			case Packet::Operation::server_halved:
+			{
+				/* The close operation and send side shutdown notification are not
+				   asynchronous network operations. They are queued to the IOCP by the
+				   application, so they are always delivered with a successful status. */
+				_ASSERT_EXPR(FALSE, L"TCP::workerLoop(): Asynchronous errors are not supposed "
+			        L"to be possible on SERVER_CLOSE or SERVER_HALVED packets");
+				// async_error(remote, io, wsa_error);
+
+				break;
+			}
+
+			case Packet::Operation::client_read:
+			case Packet::Operation::client_write:
+			case Packet::Operation::client_connect:
+			case Packet::Operation::client_disconnect:
+			case Packet::Operation::client_close:
+			case Packet::Operation::client_halved:
+				_ASSERT_EXPR(FALSE, L"TCP::workerLoop(): CLIENT_* operations are not yet implemented");
 				break;
 
 			default:
-				(refApp.*pmfnErrorProc)(this, nullptr, nullptr, e);
-				
-				// Timeout occured
-				if(!bRunning.load() && !io)
-				{
-					bool last = false;
-					mNotifyMutex.lock();
-					if(++dwBarrierCount == hWorkers.size())
-						last = true;
-					mNotifyMutex.unlock();
-					
-					if(last) mNotifyCV.notify_one();
-					
-					std::unique_lock<std::mutex> sync{ mBarrierMutex };
-				}
-				
+				/* wsa_error should indicate a dequeue timeout */
+				async_error(*remote->port, nullptr, nullptr, wsa_error);
+
 				break;
 			}
 		}
-		else // Handle network event
+		else /* Handle network event */
 		{
 			switch (io->op)
 			{
-			case Connection::Packet::Operation::READ:
-				// Must decrement counter for unqueued packets regardless of callback exceptions
-				--client->mOutstanding;
-
+			case Packet::Operation::server_read:
+			{
+				/* If the client send side was shutdown, don't update outstanding,
+				   and requeue packet for SERVER_HALVED notification */
 				if (bytes == 0)
-				{	
-					Logger::dbg("Sending disconnect");
+				{
+					globalLog.dbg("Received 0 bytes on client socket");
 
-					/* Acknowledge disconnect, don't try to initiate it */
-					client->sendDisconnect();
-					
-					io->op = Connection::Packet::Operation::CLOSE;
+					io->op = Packet::Operation::server_halved;
 					PostQueuedCompletionStatus(
 						hCompPort,
 						0,
-						reinterpret_cast<ULONG_PTR>(client),
+						reinterpret_cast<ULONG_PTR>(remote),
 						reinterpret_cast<LPOVERLAPPED>(io)
 					);
 				}
 				else
 				{
-					(refApp.*pmfnReadProc)(this, client, io, bytes);
+					server_read(*remote->port, remote, io, bytes);
+
+					// remote->outstanding.fetch_sub(1, std::memory_order_relaxed);
+					shutdown_aware_decrement = true;
 				}
-					
-				break;
-
-			case Connection::Packet::Operation::WRITE:
-				--client->mOutstanding;
-
-				(refApp.*pmfnWriteProc)(this, client, io, bytes);
-
-				break;
-
-			case Connection::Packet::Operation::ACCEPT:
-			{
-				SOCKET newsock = reinterpret_cast<SOCKET>(io->ptr);
-				io->ptr = nullptr; // Applications should never have direct access to the socket
-
-				mAcceptMutex.lock();
-				size_t removed = mPostedAccepts.erase(newsock);
-				size_t numPosted = mPostedAccepts.size();
-				mAcceptMutex.unlock();
-
-				int result = setsockopt(
-					newsock,
-					SOL_SOCKET,
-					SO_UPDATE_ACCEPT_CONTEXT,
-					(char*)&this->mSocket,
-					sizeof(SOCKET)
-				);
-				
-				if (result == SOCKET_ERROR)
-				{
-					result = WSAGetLastError();
-					(refApp.*pmfnErrorProc)(this, nullptr, io, result);
-					closesocket(newsock);
-					break;
-				}
-
-				void* mem = HeapAlloc(hServerHeap, 0, sizeof(Connection));
-
-				//if (!mem) return nullptr;
-
-				DWORD64 count = mAcceptCount++;
-				Connection* connected = new(mem) Connection{ newsock };
-
-				if (!CreateIoCompletionPort(
-					reinterpret_cast<HANDLE>(newsock),
-					hCompPort,
-					reinterpret_cast<ULONG_PTR>(connected),
-					0))
-				{
-					result = GetLastError();
-					(refApp.*pmfnErrorProc)(this, nullptr, io, result);
-					closesocket(newsock);
-					connected->~Connection();
-					HeapFree(hServerHeap, 0, connected);
-					break;
-				}
-				
-				int namelen = sizeof(connected->mAddr);
-				getpeername(connected->mSocket, &connected->mAddr, &namelen);
-
-				mConnectionsMutex.lock();
-				mConnections.insert(connected);
-				mConnectionsMutex.unlock();
-
-				if (numPosted < mConfig.acceptPostMin) postAcceptSocket();
-				
-				(refApp.*pmfnAcceptProc)(this, connected, io, 0);
 
 				break;
 			}
 
-			case Connection::Packet::Operation::CLOSE:
+			case Packet::Operation::server_write:
 			{
-				if (client->mOutstanding.load() > 0)
+				server_write(*remote->port, remote, io, bytes);
+
+				// remote->outstanding.fetch_sub(1, std::memory_order_relaxed);
+				shutdown_aware_decrement = true;
+
+				break;
+			}
+
+			case Packet::Operation::server_accept:
+			{
+				DWORD opt = TRUE;
+				int namelen = sizeof(SOCKADDR);
+				bool discard = false;
+
+				remote = static_cast<Connection*>(io->internal);
+				/* In case there is a backlog of completed accepts at the time a port
+				   begins shutdown, we want to skip setsockopt and go directly to
+				   deleting the connection. Once inside the lock, we must check again
+				   whether the port is closing since shutdown may have been initiated
+				   between the first check and acquiring the lock. */
+				if (remote->port->closing)
 				{
-					Logger::dbg("Waiting to close on " + Logger::addrString(client->sockaddr()));
-					PostQueuedCompletionStatus(
-						hCompPort,
-						0,
-						reinterpret_cast<ULONG_PTR>(client),
-						reinterpret_cast<LPOVERLAPPED>(io)
-					);
+					discard = true;
 				}
 				else
 				{
-					// Execute callback while we still have a valid client
-					(refApp.*pmfnCloseProc)(this, client, io, 0);
+					int result = setsockopt(
+						remote->mSocket,
+						SOL_SOCKET,
+						SO_UPDATE_ACCEPT_CONTEXT,
+						reinterpret_cast<char*>(&remote->mSocket),
+						sizeof(SOCKET)
+					);
 
-					Logger::dbg("Closing socket");
+					if (result == SOCKET_ERROR)
+					{
+						result = WSAGetLastError();
+						async_error(*remote->port, nullptr, io, result);
 
-					/* Initiate cancellation of outstanding operations */
-					closesocket(client->mSocket);
-					
-					Logger::dbg("Clearing client");
-					
-					mConnectionsMutex.lock();
-					mConnections.erase(client);
-					mConnectionsMutex.unlock();
-					
-					client->~Connection();
-					HeapFree(hServerHeap, 0, client);
+						discard = true;
+					}
+					else
+					{
+						remote->port->controlMutex.lock();
+						if (remote->port->closing)
+						{
+							discard = true;
+						}
+						else
+						{
+							remote->linkage = remote->port->connections.insert(
+								remote->port->connections.end(),
+								remote
+							);
+						}
+						remote->port->controlMutex.unlock();
+					}
 				}
+
+				if (discard)
+				{
+					closesocket(remote->mSocket);
+					remote->~Connection();
+					connection_cache.dealloc(remote);
+				}
+				else
+				{
+					getpeername(remote->mSocket, &remote->mAddr, &namelen);
+					server_accept(*remote->port, remote, io, 0);
+				}
+
+				/* Atomic decrement, and if last, notify the port in case it is waiting */
+				if (remote->port->acceptCount
+						.fetch_sub(1, std::memory_order_relaxed) == 1)
+				{
+					remote->port->acceptsCancelledCond.notify_one();
+				}
+
+				break;
+			}
+
+			case Packet::Operation::server_close:
+			{
+				bool notify = false;
+				bool cleanup = false;
+
+				/* Execute callback while we still have a valid client */
+				server_close(*remote->port, remote, io, 0);
+
+				globalLog.dbg("Closing socket and clearing connection");
+
+				remote->port->controlMutex.lock();
+				/* No outstanding operations, remove from list now */
+				if (remote->outstanding.load(std::memory_order_relaxed) == 1)
+				{
+					cleanup = true;
+					remote->port->connections.erase(remote->linkage);
+					if (remote->port->connections.empty())
+						notify = true;
+				}
+
+				/* Initiate cancellation of outstanding operations. If closing is already set
+				   then closesocket has already been called so we don't want to call it twice. */
+				if (!remote->port->closing)
+				{
+					WSASendDisconnect(remote->mSocket, NULL);
+					closesocket(remote->mSocket);
+				}
+				remote->port->controlMutex.unlock();
+
+				if (cleanup)
+				{
+					if (notify)
+						remote->port->connectionsClosedCond.notify_one();
+
+					remote->~Connection();
+					connection_cache.dealloc(remote);
+				}
+
+				break;
+			}
+
+			case Packet::Operation::server_halved:
+			{
+				server_halved(*remote->port, remote, io, 0);
+
+				remote->outstanding.fetch_sub(1, std::memory_order_relaxed);
+
+				break;
+			}
+			
+			case Packet::Operation::client_read:
+			case Packet::Operation::client_write:
+			case Packet::Operation::client_connect:
+			case Packet::Operation::client_disconnect:
+			case Packet::Operation::client_close:
+			case Packet::Operation::client_halved:
+				_ASSERT_EXPR(FALSE, L"TCP::workerLoop(): CLIENT_* operations are not yet implemented");
+				break;
+
+			case Packet::Operation::internal_barrier:
+			{
+				/* Synchronization barrier */
+				bool last = false;
+				mNotifyMutex.lock();
+				if(++dwBarrierCount == hWorkers.size())
+					last = true;
+				mNotifyMutex.unlock();
+
+				if(last) mNotifyCV.notify_one();
+
+				/* Wait for controller to resume workers */
+				std::unique_lock<std::mutex> sync{ mBarrierMutex };
 
 				break;
 			}
 
 			default:
-				/* Synchronization barrier */
-				if(io == &barrier_packet || io == &close_packet)
-				{
-					bool last = false;
-					mNotifyMutex.lock();
-					if(++dwBarrierCount == hWorkers.size())
-						last = true;
-					mNotifyMutex.unlock();
-					
-					if(last) mNotifyCV.notify_one();
-					
-					/* Closing server socket, set timeout for client response */
-					if(io == &close_packet)
-						timeout = mConfig.shutdownTimeoutMs;
-					
-					std::unique_lock<std::mutex> sync{ mBarrierMutex };
-				}
-				
+				_ASSERT_EXPR(FALSE, L"TCP::workerLoop(): This machine is on fire");
 				break;
+			}
+		}
+
+		if (shutdown_aware_decrement)
+		{
+			/* It is necessary to check the number of outstanding operations before
+			   decrementing. This ensures that if a port is being closed concurrently,
+			   the connection will not be deleted twice concurrently because the number
+			   of outstanding operations remains non-zero while the connection is being
+			   destroyed in the if branch. Short circuiting the '&&' makes this a
+			   relaxed-only operation in most cases. */
+			if (remote->outstanding.load(std::memory_order_relaxed) == 1
+				&& remote->port->closing == true)
+			{
+				bool notify = false;
+
+				remote->port->controlMutex.lock();
+				remote->port->connections.erase(remote->linkage);
+				if (remote->port->connections.empty())
+					notify = true;
+				remote->port->controlMutex.unlock();
+
+				if (notify)
+					remote->port->connectionsClosedCond.notify_one();
+
+				remote->~Connection();
+				connection_cache.dealloc(remote);
+			}
+			else
+			{
+				remote->outstanding.fetch_sub(1, std::memory_order_relaxed);
 			}
 		}
 	}
 }
 
-template<class A>
-void Hydra::TCPServer<A>::acquireSocket()
+SOCKET Hydra::TCP::acquireSocket(bool server, PCSTR addr, PCSTR port, UINT backlog)
 {
-	struct addrinfo req, *result;
-	int status = 0;
+	SOCKET socket;
+	LPFN_ACCEPTEX pAcceptEx;
+	struct addrinfo req;
+	struct addrinfo *result = nullptr;
+	DWORD status = 0;
+	std::string msg;
 
 	ZeroMemory(&req, sizeof(struct addrinfo));
-	req.ai_flags = AI_PASSIVE;
 	req.ai_family = AF_INET;
 	req.ai_socktype = SOCK_STREAM;
 	req.ai_protocol = IPPROTO_TCP;
 
-	status = getaddrinfo(mConfig.hostname, mConfig.port, &req, &result);
-	if (status != 0)
+	if (server)
 	{
-		//Check here for WSANOTINITIALIZED error and throw exception for that accordingly
-		throwWithError<ServerException>("TCPServer::acquireSocket(): \
-			getaddrinfo() failed", status);
+		req.ai_flags = AI_PASSIVE;
 	}
 
-	mSocket = WSASocket(
+	status = getaddrinfo(addr, port, &req, &result);
+	if (status != 0)
+	{
+		throw SynchronousException{ "TCP::acquireSocket(): getaddrinfo() failed", status };
+	}
+
+	socket = WSASocket(
 		result->ai_family,
 		result->ai_socktype,
 		result->ai_protocol,
@@ -381,216 +520,142 @@ void Hydra::TCPServer<A>::acquireSocket()
 		WSA_FLAG_OVERLAPPED
 	);
 
-	if (mSocket == INVALID_SOCKET)
+	if (socket == INVALID_SOCKET)
 	{
-		int e = WSAGetLastError();
-		freeaddrinfo(result);
-		throwWithError<ServerException>("TCPServer::acquireSocket(): \
-			WSASocket() failed", e);
+		msg = "TCP::acquireSocket(): WSASocket() failed";
+		goto socket_acquire_fail;
 	}
 
 	/* Do not allow any other application to use the server's address and port. */
 	BOOL set_exclusive = TRUE;
-	if (setsockopt(mSocket,
+	if (setsockopt(socket,
 		SOL_SOCKET,
 		SO_EXCLUSIVEADDRUSE,
 		(char*) &set_exclusive,
 		sizeof(BOOL)) == SOCKET_ERROR)
 	{
-		int e = WSAGetLastError();
-		freeaddrinfo(result);
-		closesocket(mSocket);
-		throwWithError<ServerException>(
-			"TCPServer::acquireSocket(): unable to set SO_EXCLUSIVEADDRUSE", e);
+		msg = "TCP::acquireSocket(): unable to set SO_EXCLUSIVEADDRUSE";
+		goto socket_acquire_fail;
 	}
 
 	/* Use packet buffer on heap directly.
 		Buffers must remain valid until completion. */
 	DWORD set_size = 0;
-	if (setsockopt(mSocket,
+	if (setsockopt(socket,
 		SOL_SOCKET,
 		SO_SNDBUF,
 		(char*) &set_size,
 		sizeof(DWORD)) == SOCKET_ERROR)
 	{
-		int e = WSAGetLastError();
-		freeaddrinfo(result);
-		closesocket(mSocket);
-		throwWithError<ServerException>(
-			"TCPServer::acquireSocket(): unable to set SO_SNDBUF to 0", e);
+		msg = "TCP::acquireSocket(): unable to set SO_SNDBUF to 0";
+		goto socket_acquire_fail;
 	}
 
-	if (setsockopt(mSocket,
+	if (setsockopt(socket,
 		SOL_SOCKET,
 		SO_RCVBUF,
 		(char*) &set_size,
 		sizeof(DWORD)) == SOCKET_ERROR)
 	{
-		int e = WSAGetLastError();
-		freeaddrinfo(result);
-		closesocket(mSocket);
-		throwWithError<ServerException>("TCPServer::acquireSocket(): \
-			unable to set SO_RCVBUF to 0", e);
+		msg = "TCP::acquireSocket(): unable to set SO_RCVBUF to 0";
+		goto socket_acquire_fail;
 	}
 
-	if (bind(mSocket, result->ai_addr, result->ai_addrlen) == SOCKET_ERROR)
+	if (server && bind(socket, result->ai_addr, result->ai_addrlen) == SOCKET_ERROR)
 	{
-		int e = WSAGetLastError();
-		freeaddrinfo(result);
-		closesocket(mSocket);
-		throwWithError<ServerException>("TCPServer::acquireSocket(): \
-			bind() failed", e);
+		msg = "TCP::acquireSocket(): bind() failed";
+		goto socket_acquire_fail;
 	}
-
-	if (listen(mSocket, mConfig.backlog) == SOCKET_ERROR)
-	{
-		int e = WSAGetLastError();
-		freeaddrinfo(result);
-		closesocket(mSocket);
-		throwWithError<ServerException>("TCPServer::acquireSocket(): \
-			listen() failed", e);
-	}
-
-	freeaddrinfo(result);
-
-	if (!CreateIoCompletionPort(reinterpret_cast<HANDLE>(mSocket), hCompPort, 0, 0))
-	{
-		int e = GetLastError();
-		closesocket(mSocket);
-		throwWithError<ServerException>("TCPServer::acquireSocket(): \
-			failed to associate server socket with completion port", e);
-	}
-
-	if (loadAcceptEx(mSocket, &fnAcceptEx) == SOCKET_ERROR)
-	{
-		int e = WSAGetLastError();
-		closesocket(mSocket);
-		throwWithError<ServerException>("TCPServer::acquireSocket(): \
-			failed to acquire function pointer to AcceptEx", e);
-	}
-}
-
-template<class A>
-void Hydra::TCPServer<A>::postInitialAccepts()
-{
-	UINT16 v = (mConfig.acceptPostMin + mConfig.acceptPostMax) / 2;
-	
-	Logger::info(std::string{"Posting "} + std::to_string(v) + " initial accepting sockets");
-	
-	for (UINT16 a = 0; a < v; ++a)
-		postAcceptSocket();
-}
-
-template<class A>
-void Hydra::TCPServer<A>::releaseSocket()
-{	
-	/* On return from synchronizeWorkers() this thread has
-		exclusive control until mBarrierMutex is unlocked below. */
-	synchronizeWorkers(&close_packet);
-
-	closesocket(mSocket);
-
-	Logger::dbg("Closing all pending accept sockets");
-
-	for (SOCKET pending : mPostedAccepts)
-		closesocket(pending);
-	mPostedAccepts.clear();
-
-	Logger::dbg("Closing all open connections");
-
-	/* Phase 1: attempt graceful disconnect of clients */
-	for (Connection* open : mConnections)
-	{
-		Connection::Packet* disconn = acquirePacket(Connection::Packet::READ, 0, nullptr);
-		open->sendDisconnect(disconn);
-	}
-	
-	Logger::dbg("Sent out disconnects");
-	
-	/* Resume workers for cleanup */
-	mBarrierMutex.unlock();
 
 	/*
-		At this point, all remaining packets will be processed.
-		Graceful closure will occur on clients that acknowledge
-		the disconnect and remaining data will be read.
-		Workers now have a timeout set in their event loop
-		and will synchronize below on their first timeout.
+		Big todo right here. When acting as a client, good design dictates we attempt
+		multiple interfaces returned by getaddrinfo() until we get a successful connection
+		or run out of addrinfo's. So we can't simply return a socket, and need a way
+		to persist the addinfo data so ConnectEx can fail asynchronously and be attempted
+		on the next interface in the worker loop.
 	*/
-	
-	synchronizeWorkers(nullptr);
 
-	/* Phase 2: forcibly terminate connections */
-	if (!mConnections.empty())
+	freeaddrinfo(result);
+	result = nullptr;
+
+	if (server && ::listen(socket, backlog) == SOCKET_ERROR)
 	{
-		Logger::dbg("Forcibly closing sockets");
-	
-		for (Connection* remaining : mConnections)
-		{
-			closesocket(remaining->mSocket);
-			Logger::dbg(Logger::addrString(remaining->sockaddr()));
-		}
-		
-		mBarrierMutex.unlock();
-		
-		/*
-			Workers will process aborted IO packets until they
-			timeout and synchrnoize again here, at which point
-			the server can destroy connection objects.
-		*/
-		
-		synchronizeWorkers(nullptr);
-		
-		for(Connection* remaining : mConnections)
-		{
-			remaining->~Connection();
-			HeapFree(hServerHeap, 0, remaining);
-		}	
+		msg = "TCP::acquireSocket(): listen() failed";
+		goto socket_acquire_fail;
 	}
-	
-	Logger::dbg("All connections closed");
-	
-	mBarrierMutex.unlock();
+
+	if (!CreateIoCompletionPort(reinterpret_cast<HANDLE>(socket), hCompPort, 0, 0))
+	{
+		msg = "TCP::acquireSocket(): failed to associate socket with completion port";
+		goto socket_acquire_fail;
+	}
+
+	if (server)
+	{
+		if (loadAcceptEx(socket, &pAcceptEx) == SOCKET_ERROR)
+		{
+			msg = "TCP::acquireSocket(): failed to acquire function pointer to AcceptEx";
+			goto socket_acquire_fail;
+		}
+		else if(fnAcceptEx != nullptr && pAcceptEx != fnAcceptEx)
+		{
+			msg = "TCP::acquireSocket(): new pointer to AcceptEx differs from existing pointer";
+			goto socket_acquire_fail;
+		}
+		else if(fnAcceptEx == NULL)
+		{
+			fnAcceptEx = pAcceptEx;
+		}
+	}
+
+	return socket;
+
+socket_acquire_fail:
+	status = WSAGetLastError();
+
+	if (result != nullptr) freeaddrinfo(result);
+	if (socket != INVALID_SOCKET)
+	{
+		closesocket(socket);
+		socket = INVALID_SOCKET;
+	}
+	throw SynchronousException{ msg, status };
 }
 
-template<class A>
-void Hydra::TCPServer<A>::setupCompletionPort()
+void Hydra::TCP::setupCompletionPort()
 {
 	hCompPort = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, 0);
 	if (!hCompPort)
 	{
-		int e = GetLastError();
-		throwWithError<ServerException>(
-			"TCPServer::setupCompletionPort(): unable to create a new completion port",
-			e);
+		throw SynchronousException{
+			"TCP::setupCompletionPort(): unable to create a new completion port",
+			GetLastError()
+		};
 	}
 }
 
-template<class A>
-void Hydra::TCPServer<A>::cleanupCompletionPort()
+void Hydra::TCP::cleanupCompletionPort()
 {
 	CloseHandle(hCompPort);
 }
 
-template<class A>
-void Hydra::TCPServer<A>::launchWorkers()
+void Hydra::TCP::launchWorkers()
 {
+	unsigned id = 0;
 	for (std::thread& t : hWorkers)
 	{
-		t = std::thread{ &TCPServer::workerLoop, this };
+		t = std::thread{ &TCP::workerLoop, this, id++ };
 	}
 }
 
-template<class A>
-void Hydra::TCPServer<A>::terminateWorkers()
+void Hydra::TCP::terminateWorkers()
 {
-	Logger::dbg("Terminating threads");
+	globalLog.dbg("Terminating threads");
 
 	for (auto i = 0; i < hWorkers.size(); i++)
 	{
-		PostQueuedCompletionStatus(hCompPort,
-			0, 0,
-			reinterpret_cast<LPOVERLAPPED>(&shutdown_packet));
+		PostQueuedCompletionStatus(hCompPort,0, 0,
+			reinterpret_cast<LPOVERLAPPED>(&terminate_packet));
 	}
 
 	for (std::thread& t : hWorkers)
@@ -599,108 +664,173 @@ void Hydra::TCPServer<A>::terminateWorkers()
 	}
 }
 
-template<class A>
-void Hydra::TCPServer<A>::synchronizeWorkers(Connection::Packet *broadcast)
+/* Since multiple threads will dequeue the same packet/address, broadcast must be
+   an internal message that is safe for multiple threads to run */
+void Hydra::TCP::synchronizeWorkers(Packet *broadcast)
 {
-	Logger::dbg("Initiating synchronization barrier");
+	globalLog.dbg("Initiating synchronization barrier");
 
 	mBarrierMutex.lock();
-	
+
 	dwBarrierCount = 0;
-	
+
 	/* If broadcast is not NULL, we broadcast it to workers */
 	for (auto i = 0; broadcast && i < hWorkers.size(); i++)
 	{
-		PostQueuedCompletionStatus(hCompPort,
-			0, 0,
+		PostQueuedCompletionStatus(hCompPort, 0, 0,
 			reinterpret_cast<LPOVERLAPPED>(broadcast));
 	}
-	
+
 	std::unique_lock<std::mutex> sync{ mNotifyMutex };
-	
+
 	/* Make sure all workers haven't yielded before sleeping. */
-	if(dwBarrierCount != hWorkers.size())
+	if (dwBarrierCount != hWorkers.size())
 		mNotifyCV.wait(sync);
-	
+
 	/* At this point, all workers are waiting on mBarrierMutex.
 		mNotifyMutex will be released on return. */
 }
 
-template<class A>
-void Hydra::TCPServer<A>::postAcceptSocket()
+void Hydra::TCP::resumeWorkers()
+{
+	mBarrierMutex.unlock();
+}
+
+void Hydra::TCP::postAcceptSocket(OpenPort &port, Packet *packet)
 {
 	SOCKET newsock = WSASocket(AF_INET, SOCK_STREAM, IPPROTO_TCP, NULL, 0, WSA_FLAG_OVERLAPPED);
+	DWORD acceptExBytes;
+	Connection *pending;
 
 	if (newsock == INVALID_SOCKET)
 	{
-		(refApp.*pmfnErrorProc)(this, nullptr, nullptr, WSAGetLastError());
+		throw SynchronousException{
+			"TCP::postAcceptSocket(): Error creating new socket",
+	 		static_cast<DWORD>(WSAGetLastError())
+		};
 		return;
 	}
 
-	mAcceptMutex.lock();
-	mPostedAccepts.insert(newsock);
-	mAcceptMutex.unlock();
-
-	Connection::Packet* pending = acquirePacket(
-		Connection::Packet::ACCEPT,
-		mConfig.acceptPacketSize,
-		reinterpret_cast<PVOID>(newsock)
-	);
-
-	BOOL ret = fnAcceptEx(
-		mSocket,
-		newsock,
-		mAcceptExBuffer,
-		0,
-		sizeof(sockaddr_in) + 16,
-		sizeof(sockaddr_in) + 16,
-		&mAcceptExBytes,
-		reinterpret_cast<LPOVERLAPPED>(pending)
-	);
-
-	if (!ret) 
+	void *mem = connection_cache.alloc();
+	if (!mem)
 	{
-		ret = WSAGetLastError();
+		throw SynchronousException{
+			"TCP::postAcceptSocket(): Error allocating new connection",
+			0
+		};
+	}
+	else
+	{
+		pending = new(mem) Connection{};
+		pending->mSocket = newsock;
+		pending->port = &port;
 
-		if (ret != WSA_IO_PENDING)
+		if (!CreateIoCompletionPort(
+			reinterpret_cast<HANDLE>(newsock),
+			hCompPort,
+			reinterpret_cast<ULONG_PTR>(pending),
+			0))
 		{
-			pending->ptr = nullptr;
-			(refApp.*pmfnErrorProc)(this, nullptr, pending, ret);
-
-			mAcceptMutex.lock();
-			mPostedAccepts.erase(newsock);
-			mAcceptMutex.unlock();
+			DWORD result = GetLastError();
 			closesocket(newsock);
+			pending->~Connection();
+			connection_cache.dealloc(pending);
+
+			throw SynchronousException{
+				"TCP::postAcceptSocket(): Unable to associate new connection with the "
+				"completion port", result
+			};
 		}
 	}
+
+	packet->op = Packet::Operation::server_accept;
+	packet->internal = pending;
+
+	BOOL ret = fnAcceptEx(
+		port.mSocket,
+		newsock,
+		packet->wsa.buf,
+		0,
+		sizeof(SOCKADDR_STORAGE) + 16,
+		sizeof(SOCKADDR_STORAGE) + 16,
+		&acceptExBytes,
+		reinterpret_cast<LPOVERLAPPED>(packet)
+	);
+
+	if (!ret)
+	{
+		DWORD status = WSAGetLastError();
+
+		if (status != WSA_IO_PENDING)
+		{
+			closesocket(newsock);
+			pending->~Connection();
+			connection_cache.dealloc(pending);
+
+			throw SynchronousException{ "TCP::postAcceptSocket(): AcceptEx failed", status };
+		}
+	}
+
+	port.acceptCount.fetch_add(1, std::memory_order_relaxed);
 }
 
-template<class A>
-BYTE Hydra::TCPServer<A>::mAcceptExBuffer[] = { 0 };
+/*
+	The following are all empty default implmenetations so that applications do not
+	need to explicitly override each operation processor. This is particularly convenient
+	when implementing only the server or client side within an application.
+*/
+void Hydra::TCP::server_read(OpenPort &port, Connection *client,
+							 Packet *data, DWORD io_bytes) noexcept { }
 
-template<class A>
-DWORD Hydra::TCPServer<A>::mAcceptExBytes = 0;
+void Hydra::TCP::server_write(OpenPort &port, Connection *client,
+							  Packet *data, DWORD io_bytes) noexcept { }
 
-template<class A>
-Hydra::Connection::Packet Hydra::TCPServer<A>::shutdown_packet =
-	Hydra::Connection::Packet
+void Hydra::TCP::server_accept(OpenPort &port, Connection *client,
+							  Packet *data, DWORD io_bytes) noexcept { }
+
+void Hydra::TCP::server_close(OpenPort &port, Connection *client,
+							  Packet *data, DWORD io_bytes) noexcept { }
+
+void Hydra::TCP::server_halved(OpenPort &port, Connection *client,
+							   Packet *data, DWORD io_bytes) noexcept { }
+
+void Hydra::TCP::client_read(OpenPort &port, Connection *server,
+							 Packet *data, DWORD io_bytes) noexcept { }
+
+void Hydra::TCP::client_write(OpenPort &port, Connection *server,
+							  Packet *data, DWORD io_bytes) noexcept { }
+
+void Hydra::TCP::client_connect(OpenPort &port, Connection *server,
+								Packet *data, DWORD io_bytes) noexcept { }
+
+void Hydra::TCP::client_disconnect(OpenPort &port, Connection *server,
+								   Packet *data, DWORD io_bytes) noexcept { }
+
+void Hydra::TCP::client_close(OpenPort &port, Connection *server,
+							  Packet *data, DWORD io_bytes) noexcept { }
+
+void Hydra::TCP::client_halved(OpenPort &port, Connection *server,
+							   Packet *data, DWORD io_bytes) noexcept { }
+
+void Hydra::TCP::async_error(OpenPort &port, Connection *remote,
+							 Packet *data, DWORD error) noexcept { }
+
+Hydra::Packet Hydra::TCP::terminate_packet =
+	Hydra::Packet
 	{
-		Connection::Packet::Operation::EXCEPTIONAL,
-		0, nullptr, nullptr
+		Packet::Operation::internal_terminate,
+		0, nullptr
 	};
-	
-template<class A>
-Hydra::Connection::Packet Hydra::TCPServer<A>::barrier_packet =
-	Hydra::Connection::Packet
+
+Hydra::Packet Hydra::TCP::barrier_packet =
+	Hydra::Packet
 	{
-		Connection::Packet::Operation::EXCEPTIONAL,
-		0, nullptr, nullptr
+		Packet::Operation::internal_barrier,
+		0, nullptr
 	};
-	
-template<class A>
-Hydra::Connection::Packet Hydra::TCPServer<A>::close_packet =
-	Hydra::Connection::Packet
-	{
-		Connection::Packet::Operation::EXCEPTIONAL,
-		0, nullptr, nullptr
-	};
+
+Hydra::TCP::OpenPort::OpenPort(SOCKET listening, HANDLE iocp) :
+	mSocket{ listening }, hCompPort{ iocp }, closing{ false }, acceptCount{ 0 }
+{
+
+}

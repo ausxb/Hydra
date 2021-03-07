@@ -2,39 +2,26 @@
 
 #include <WinSock2.h>
 #include <WS2tcpip.h>
+#include <Mswsock.h>
 #include <Windows.h>
 
+#include <list>
 #include <vector>
-#include <set>
-#include <unordered_set>
-#include <thread> //Using C++ threads should initialize CRT thread-local features
+#include <thread>
 #include <mutex>
 #include <condition_variable>
 #include <atomic>
 #include <chrono>
 
-#include "util.h"
-#include "Connection.h"
-#include "Logger.h"
+#include "allocators/EmbeddedSlabCache.h"
 
 namespace Hydra
 {
-	struct ServerConfig
-	{
-		PCSTR hostname;
-		PCSTR port;
-		UINT initWorkers;
-		UINT backlog;
-		UINT heapSize;
-		UINT connModulo;
-		ULONG acceptPacketSize;
-		UINT16 acceptPostMin;
-		UINT16 acceptPostMax;
-		ULONG shutdownTimeoutMs;
-	};
+	class Connection;
+	class Packet;
 
 	/*!
-	 * \class TCPServer TCPServer.h
+	 * \class TCP TCP.h
 	 *
 	 * Implements a TCP server using IO Completion Ports to enhance scalability.
 	 * This is a template class with type parameters for a class representing the server side
@@ -50,167 +37,208 @@ namespace Hydra
 	 * Instances of TCPServer or related objects must not be shared between processes as the underyling synchronization
 	 * stuctures will not work across processes.
 	 *
-	 * \tparam A The application class for which the Server provides networking and which contains the send and receive callbacks.
 	 */
-	template<class A>
-	class TCPServer
+	class TCP
 	{
 	public:
-		/*!
-		 * \brief A user-supplied callback function run when when a IO completion packet is dequeued.
-		 *
-		 * For details on application callbacks see \ref callbacks "Server Application Callbacks".
-		 *
-		 * \param[in] server A pointer to the server.
-		 * \param[in] client A pointer to the client's connection.
-		 * \param[in] packet A pointer to the packet.
-		 * \param[in] bytes The number of bytes transferred during the completed IO operation, or the error code in an error notification callback.
-		 */
-		using Procedure = void (A::*)(const TCPServer*, Connection*, Connection::Packet*, DWORD);
-
-		TCPServer(
-			A& application,
-			Procedure readproc,
-			Procedure writeproc,
-			Procedure acceptproc,
-			Procedure closeproc,
-			Procedure errorproc,
-			const ServerConfig& config
-		);
-
-		~TCPServer();
 
 		/*!
-		 * \brief Start the server.
+		 * \class OpenPort TCP.h
 		 *
-		 * Executes the sequence of operations that establishes a running server, throwing exceptions
-		 * in case startup cannot be completed with the requested parameters (e.g. port number).
-		 * First a new completion port is created, then it launches worker threads, sets up a
-		 * listening port, and posts the initial number of outstanding accept operations.
-		 *
-		 * Starting a server that is already running has no effect.
-		 *
-		 * \throws Hydra::ServerException server setup encountered an error.
+		 * Represents a TCP port that the application is listening on in the capacity of a server.
+		 * It is essentially a handle returned by a successful call to TCP::listen().
 		 */
-		void start();
+		class OpenPort
+		{
+		public:
+			/*!
+			 * \brief A constructor that is only accessible to instances of TCP.
+			 */
+			OpenPort(SOCKET listening, HANDLE iocp);
+
+		private:
+			/*
+			 * TCP is allowed to directly access port details. This is so that no public interface
+			 * is needed for those details, which are best hidden from the application. Connection
+			 * is also "trusted" since it does not expose access to OpenPort's internals through
+			 * its public interface.
+			 */
+			friend class TCP;
+			friend class Connection;
+
+			SOCKET mSocket;
+			HANDLE hCompPort;
+			std::atomic_bool closing;
+			std::atomic_int acceptCount;
+
+			std::mutex controlMutex; // Hopefully, this is a CRITICAL_SECTION under the hood
+			std::list<Connection*> connections;
+			std::condition_variable connectionsClosedCond;
+			std::condition_variable acceptsCancelledCond;
+
+			std::list<OpenPort>::iterator linkage;
+
+			/*std::mutex mAcceptMutex;
+			std::unordered_set<Connection*> mPostedAccepts;*/
+		};
+
+		TCP(unsigned initWorkers, unsigned long shutdownTimeoutMs);
+
+		~TCP();
 
 		/*!
-		 * \brief Stop the server.
+		 * \brief Termiante all connections and shutdown the application.
 		 *
-		 * Calling this from within an application callback will deadlock the server.
+		 * Calling this from within an application callback will deadlock the system.
 		 *
-		 * Executes the sequence of operations that terminates a running server. The listening socket
-		 * is first closed, rejecting new connections, then outstanding accepting sockets are closed.
-		 * Disconnect is initiated on all open connections, and the server waits for remote peers
-		 * to indicate connection shutdown and for all outstanding operations to complete,
-		 * possibly with error in the case that the socket is already closed. Resources are freed
-		 * except for the server heap, which persists through the lifetime of the server object.
-		 *
-		 * Stopping a server that is not running has no effect.
+		 * This function is designed to allow concurrent shutdown of all ports and connection,
+		 * instead of issuing a blocking call to TCP::close() for each open ports and waiting.
+		 * Stopping a server that is not running has no effect. Unlike TCP::close(), which must
+		 * be called more than once on a reference, shutdown() is idempotent.
 		 */
-		void stop();
+		void shutdown();
 
 		/*!
-		 * \brief Create a new packet.
+		 * \brief Open and begin listening on a new server port.
 		 *
-		 * Allocates a new packet on the server heap, returning nullptr if a heap error occurs.
+		 * It is expected that server ports are opened by the application at startup,
+		 * so this function is not thread safe.
 		 *
-		 * \param[in] op A member of the Connection::Packet::Operation enumeration to initialize this packet with.
-		 * \param[in] length The length of packet's transmission buffer.
+		 * \throws SynchronousException If the requested port is not available or there
+		 * is an internal error with setting up a new socket, the source of failure is
+		 * recorded in the exception message along with a relevant WSA error code.
 		 *
-		 * \return A pointer to a new packet or nullptr on allocation failure.
+		 * \param[in] bind Address (interface) to listen on. Parameter 1 of getaddrinfo.
+		 * \param[in] port A string containing a port number, or a service name recognized
+		 *                 by Windows. Parameter 2 of getaddrinfo().
+		 * \param[in] backlog The backlog length for pending connections.
+		 *                    Parameter 2 of listen().
+		 *
+		 * \return A reference to a newly opened port if successful.
 		 */
-		Connection::Packet* acquirePacket(Connection::Packet::Operation op, ULONG length, PVOID context) const;
+		OpenPort& listen(PCSTR bind, PCSTR port, UINT backlog);
 
 		/*!
-		 * \brief Destroy a packet
+		 * \brief Close an open server port.
 		 *
-		 * Deallocates the packet from the server heap. An application must manually discard packets.
+		 * \attention Do not invoke close() more than once on an opened port.
+		 * The reference is invalidated upon being passed as an argument.
 		 *
-		 * \param[in] packet A pointer to the packet.
+		 * \param[in] port A reference returned by TCP::listen().
 		 */
-		void discardPacket(Connection::Packet* packet) const;
+		void close(OpenPort &port);
+
+		/*!
+		 * \brief Open a new client connection.
+		 *
+		 *
+		 * \return
+
+		Connection& connect(PCSTR addr, PCSTR port);
+
+		/*!
+		 * \brief Open a new client connection.
+		 *
+		 *
+		 * \return
+
+		void disconnect(Connection &connection);
+		*/
+
+		/*!
+		 * \brief Make a new socket available to accept a connection on.
+		 *
+		 * Creates a new socket and calls AcceptEx on it through TCP::fnAcceptEx.
+		 * A new Connection is created with that socket, and associated as its completion key.
+		 * Return values are checked for synchronous failure, and the error callback is
+		 * called immediately (synchronously) in this case.
+		 *
+		 * \param[in] port
+		 * \param[in] packet A pointer to a Hydra::Packet, which must contain enough
+		 * 		space to hold both a local and remote sockaddr (16 bytes).
+		 */
+		void postAcceptSocket(OpenPort &port, Packet *packet);
+
+		/*!
+		 * \brief The minimum buffer length requried for packets used with this server.
+		 *
+		 * This minimum is required by AcceptEx() to store the source and destination addresses.
+		 */
+		constexpr static DWORD minimum_packet_buffer = 2 * (sizeof(SOCKADDR_STORAGE) + 16);
 
 		/*
 			Copying the server makes little sense, the port would be unavailable anyway.
 			Since the worker threads rely on the this pointer, moving is undesirable,
 			though it is possible when the server is not running and the threads have been shut down.
 		*/
-		TCPServer(const TCPServer&) = delete;
-		TCPServer(TCPServer&&) = delete;
-		TCPServer& operator=(const TCPServer&) = delete;
-		TCPServer& operator=(TCPServer&&) = delete;
+		TCP(const TCP&) = delete;
+		TCP(TCP&&) = delete;
+		TCP& operator=(const TCP&) = delete;
+		TCP& operator=(TCP&&) = delete;
+
+	protected:
+		/*!
+		 * \brief Operation processing function for Packet::Operation::server_read.
+		 *
+		 * Operation processing functions are run when a Packet is dequeued from the completion port.
+		 * All parameters are the same, except the interpretation of the last parameter may always be
+		 * zero for operations that do not transfer application data.
+		 * For details on application callbacks see \ref callbacks "Server Application Callbacks".
+		 *
+		 * \param[in] client A pointer to the client's connection.
+		 * \param[in] packet A pointer to the packet.
+		 * \param[in] bytes The number of bytes transferred during the completed IO operation, or the error code in an error notification callback.
+		 */
+		virtual void server_read(OpenPort &port, Connection *client, Packet *data, DWORD io_bytes) noexcept;
+
+		virtual void server_write(OpenPort &port, Connection *client, Packet *data, DWORD io_bytes) noexcept;
+		virtual void server_accept(OpenPort &port, Connection *client, Packet *data, DWORD io_bytes) noexcept;
+		virtual void server_close(OpenPort &port, Connection *client, Packet *data, DWORD io_bytes) noexcept;
+		virtual void server_halved(OpenPort &port, Connection *client, Packet *data, DWORD io_bytes) noexcept;
+
+		virtual void client_read(OpenPort &port, Connection *server, Packet *data, DWORD io_bytes) noexcept;
+		virtual void client_write(OpenPort &port, Connection *server, Packet *data, DWORD io_bytes) noexcept;
+		virtual void client_connect(OpenPort &port, Connection *server, Packet *data, DWORD io_bytes) noexcept;
+		virtual void client_disconnect(OpenPort &port, Connection *server, Packet *data, DWORD io_bytes) noexcept;
+		virtual void client_close(OpenPort &port, Connection *server, Packet *data, DWORD io_bytes) noexcept;
+		virtual void client_halved(OpenPort &port, Connection *server, Packet *data, DWORD io_bytes) noexcept;
+
+		virtual void async_error(OpenPort &port, Connection *remote, Packet *data, DWORD error) noexcept;
 
 	private:
-		static Connection::Packet shutdown_packet;
-		
-		static Connection::Packet barrier_packet;
-		
-		static Connection::Packet close_packet;
+		static Packet terminate_packet;
 
-		/*
-			Note that mAcceptExBuffer and mAcceptExBytes will both incur race conditions
-			as they are used by multiple outstanding accept operations. They are
-			assumed to contain garbage but reserve necessary space.
-		*/
-		static BYTE mAcceptExBuffer[(sizeof(sockaddr_in) + 16) * 2]; ///< Scratch space for AcceptEx lpOutputBuffer
-		static DWORD mAcceptExBytes; ///< Scratch space for lpdwBytesReceived for AcceptEx
+		static Packet barrier_packet;
 
-		LPFN_ACCEPTEX fnAcceptEx;
+		void workerLoop(unsigned id);
 
-		void workerLoop();
-
-		void acquireSocket();
-		void postInitialAccepts();
-		void releaseSocket();
+		SOCKET acquireSocket(bool server, PCSTR addr, PCSTR port, UINT backlog);
 
 		void setupCompletionPort();
 		void cleanupCompletionPort();
 
 		void launchWorkers();
 		void terminateWorkers();
-		void synchronizeWorkers(Connection::Packet *broadcast);
+		void synchronizeWorkers(Packet *broadcast);
+		void resumeWorkers();
 
-		/*!
-		 * \brief Make a new socket available to accept a connection on.
-		 *
-		 * Creates a new socket and calls AcceptEx on it through TCPServer::fnAcceptEx.
-		 * A new Connection is created with that socket, and associated as its completion key.
-		 * Return values are checked for synchronous failure, and the error callback is 
-		 * called immediately (synchronously) in this case.
-		 */
-		void postAcceptSocket();
+		LPFN_ACCEPTEX fnAcceptEx;
 
-		A& refApp; ///< Reference to the server application
-		Procedure pmfnReadProc; ///< Pointer to member function input callback
-		Procedure pmfnWriteProc; ///< Pointer to member function output callback
-		Procedure pmfnAcceptProc; ///< Pointer to member function connection accept callback
-		Procedure pmfnCloseProc; ///< Pointer to member function connection close callback
-		Procedure pmfnErrorProc; ///< Pointer to member function error notification callback
-
-		const ServerConfig mConfig;
-
-		SOCKET mSocket;
-		std::mutex mConnectionsMutex; // Hopefully, this is a CRITICAL_SECTION under the hood
-		std::unordered_set<Connection*> mConnections;
-
-		std::mutex mAcceptMutex;
-		std::unordered_set<SOCKET> mPostedAccepts;
-		std::atomic_ullong mAcceptCount; ///< Integer "hash" used to assign new accepting sockets a mutex
+		EmbeddedSlabCache connection_cache;
 
 		HANDLE hCompPort;
 		std::vector<std::thread> hWorkers;
-		std::atomic_bool bRunning;
 		std::mutex mBarrierMutex;
 		std::mutex mNotifyMutex;
 		std::condition_variable mNotifyCV;
 		DWORD dwBarrierCount;
-		
-		HANDLE hServerHeap;
-		
-		static_assert(ATOMIC_LLONG_LOCK_FREE == 2, "std::atomic_ullong is not lock free");
-		static_assert(ATOMIC_BOOL_LOCK_FREE == 2, "std::atomic_bool is not lock free");
+
+		SOCKET mSocket;
+		std::mutex mConnectionsMutex; // Hopefully, this is a CRITICAL_SECTION under the hood
+		std::list<Connection*> mConnections;
+
+		std::list<OpenPort> mOpenPorts;
+
+		static_assert(ATOMIC_INT_LOCK_FREE == 2, "std::atomic_int is not lock free");
 	};
 }
-
-#include "TCPServer.cpp"

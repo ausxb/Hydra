@@ -2,9 +2,12 @@
 
 #include <WinSock2.h>
 #include <Windows.h>
+
+#include <list>
 #include <mutex>
 #include <atomic>
-#include "util.h"
+
+#include "TCP.h"
 
 namespace Hydra
 {
@@ -19,55 +22,18 @@ namespace Hydra
 	{
 	public:
 		/*!
-		 * \struct Packet Connection.h
+		 * \brief Construct a connection with an uninitialized socket.
 		 *
-		 * This structure wraps structures necessary for overlapped IO and buffers for data transfer.
-		 * Its buffer represents a packet at the application level.
-		 */
-		struct Packet
-		{
-			WSAOVERLAPPED overlapped; ///< Used for overlapped IO
-			WSABUF wsabuf; ///< Used for Winsock function calls
-			const ULONG size; ///< Stores full length available to wsabuf, useful when resending partial data
-			PVOID ptr; ///< Pointer reserved for application's use
-
-			/*!
-			 * \enum Op
-			 * The server uses this to determine when to call Server::readproc() or Server::writeproc().
-			 */
-			enum Operation { READ, WRITE, ACCEPT, CLOSE, EXCEPTIONAL };
-
-			Operation op; ///< The operation this packet is involved in
-
-			/*!
-			 * \brief Initializes all fields on a packet, allows for convenient use of placement new.
-			 *
-			 * \param[in] op_enum A member of the Connection::Packet::Operation to initialize this packet with.
-			 * \param[in] length The size of the packet's buffer, which remains constant unlike wsabuf.len.
-			 * \param[in] buffer A pointer to the buffer that is associated used by wsabuf.
-			 * \param[in] ptr A pointer reserved for the application's use.
-			 */
-			Packet(Operation op_enum, ULONG length, PCHAR buffer, PVOID context) :
-				wsabuf{ length, buffer }, size{ length },
-				op{ op_enum }, ptr{ context }
-			{
-				ZeroMemory(&overlapped, sizeof(WSAOVERLAPPED));
-			}
-		};
-
-		/*
-		 * TCPServer's worker loop is allowed to directly access connection details.
-		 * This is so that no public interface is needed for those details, which otherwise
-		 * if used by an application, might wreak havoc (e.g. locking the mutex).
-		 */
-		template<class A> friend class TCPServer;
-
-		/*!
-		 * \brief Wrap an open socket.
+		 * Since Connection is an interface exposed to applications, all internal
+		 * modifications (i.e. to the socket) are done via direct access in TCP
+		 * which is declared as a friend class. This ensures applications can
+		 * perform actions on the underlying connections through this abstraction.
 		 *
-		 * \param[in] accepted A SOCKET that has been accepted and is ready to receive/send.
+		 * Default construction allows a Connections to be created and cached
+		 * before use. A connection object can the be recycled simply by swapping
+		 * out the warpped socket handle.
 		 */
-		Connection(SOCKET accepted);
+		Connection();
 
 		Connection(const Connection&) = delete;
 		Connection& operator=(const Connection&) = delete;
@@ -103,26 +69,33 @@ namespace Hydra
 		int send(Packet* packet);
 
 		/*!
-		 * \brief Acknowledge graceful disconnect of client.
+		 * \brief Close the socket and cleanup resources.
 		 *
-		 * When a client terminates its connection, the server will successfuly read 0 bytes.
-		 * The server waits until all data has been received and then can call sendDisconnect
-		 * to gracefully close the connection.
+		 * This function is intended to be called after receiving a Packet::Operation::*_HALVED
+		 * notification, which indicates the remote peer is done sending data, and after completing any
+		 * final transmissions. This is effectively a call to closesocket() since the function issues
+		 * a Packet::Operation::*_CLOSE completion notification on the connection. Consequently,
+		 * it will cause pending asynchronous operations to return with an aborted status. To make
+		 * sure that remaining operations have finished, the caller can query the connection's outstanding
+		 * counter. This behavior also allows the function to also be for forcibly terminating a connection.
 		 *
-		 * \return Return value of WSASendDisconnect().
+		 * \attention A Connection object may be destroyed by the owning TCP instance at any point after
+		 * calling terminate(). Do not store or use the connection object after the TCP::server_close()
+		 * completion function is called. The connection may still appear in error callbacks after
+		 * TCP::server_close() has run depending on whether pending operations are being aborted. Use
+		 * any such error notifications to perform cleanup/bookkeeping but do not initiate new operations.
+		 *
+		 * \param[in] packet A packet used to queue a connection closure request to the notification loop.
 		 */
-		int sendDisconnect();
+		void terminate(Packet *packet);
 
 		/*!
-		 * \brief Initiate graceful disconnect of client from server.
+		 * \brief Initiate graceful disconnect of a connection.
 		 *
-		 * When TCPServer terminates its connections on shutdown,
-		 * it will call sendDisconnect on every open connection and wait for final data.
-		 * An outstanding read operation is necessary so that the server can be notified when the
-		 * client disconnects by receiving zero bytes. Since there may not be any outstanding
-		 * read operations on a client, the server must provide a packet to intiate a new
-		 * read operation to ensure that it can receive a close notification.
-		 * This procedure is facilitated by this method.
+		 * An outstanding read operation is necessary so that the application can be notified when the
+		 * remote side disconnects by receiving zero bytes. If the application wishes to receive
+		 * any final transmissions before closing the socket, it make additional Connection::receive()
+		 * calls in the TCP::client_disconnect() callback.
 		 *
 		 * \param[in] packet A packet on which to initiate the closing read operation.
 		 *
@@ -146,13 +119,24 @@ namespace Hydra
 		const LPSOCKADDR sockaddr();
 
 		private:
+			/*
+			 * TCP's worker loop is allowed to directly access connection details.
+			 * This is so that no public interface is needed for those details, which otherwise
+			 * if used by an application, might wreak havoc (e.g. locking the mutex).
+			 */
+			friend class TCP;
+
 			SOCKET mSocket; ///< Remote socket
 			SOCKADDR mAddr; ///< Remote address
 
-			std::mutex mOutMutex; ///< Synchronize multiple WSASend
-			std::mutex mInMutex; ///< Synchronize multiple WSARecv
+			TCP::OpenPort *port; ///< Server port through which this connection is serviced
 
-			std::atomic_uint mOutstanding; ///< IO operations outstanding
-			static_assert(ATOMIC_INT_LOCK_FREE == 2, "std::atomic_uint is not lock free");
+			std::list<Connection*>::iterator linkage;
+
+			std::mutex outMutex; ///< Synchronize multiple WSASend
+			std::mutex inMutex; ///< Synchronize multiple WSARecv
+
+			std::atomic_int outstanding; ///< IO operations outstanding
+			static_assert(ATOMIC_INT_LOCK_FREE == 2, "std::atomic_int is not lock free");
 	};
 }

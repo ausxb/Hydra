@@ -84,17 +84,11 @@ Hydra::StaticInfo static_info { };
 //========================================================================
 // Exception types
 //========================================================================
-Hydra::ServerException::ServerException(const char* msg, int err)
-	: std::runtime_error{ msg }, error_code{ err } { }
+Hydra::SynchronousException::SynchronousException(const char* msg, DWORD err)
+	: std::runtime_error{ msg }, wsa_error{ err } { }
 
-Hydra::ServerException::ServerException(const std::string& msg, int err)
-	: std::runtime_error{ msg }, error_code{ err } { }
-
-Hydra::ConnectionException::ConnectionException(const char* msg, int err)
-	: std::runtime_error{ msg }, error_code{ err } { }
-
-Hydra::ConnectionException::ConnectionException(const std::string& msg, int err)
-	: std::runtime_error{ msg }, error_code{ err } { }
+Hydra::SynchronousException::SynchronousException(const std::string& msg, DWORD err)
+	: std::runtime_error{ msg }, wsa_error{ err } { }
 
 //========================================================================
 // Retrieve the AcceptEx function

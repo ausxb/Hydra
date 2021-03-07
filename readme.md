@@ -1,35 +1,31 @@
 # Hydra
 
-Hydra is a server framework for the Windows API based on IO completion ports.
-The server class manages the connection lifecycle and events on the completion port
-using callbacks implemented as members of an application class. Several parameters
-related to network setup and resource allocation are configurable on construction of the server.
+Hydra is a networking framework for the Windows API based on IO completion ports.
+The protocol class manages the connection lifecycle and events on the completion port
+using callbacks implemented as members of an application class.
+
+The example may be built using the VS command prompt by running `nmake httphello.exe`
+from the source root. It illustrates one application listening on both port 80 and 8080.
 
 #### Changes
+- Replaced class `TCPServer` with `TCP`, creating a unified interface for client and server
+	functionality. Applications inherit from `TCP` and implement callbacks for network
+	events.
+- New design employs distinct client and server read/write and connection ops along with
+	internal messages to fully utilize the completion queue.
+- Multiple server ports can be operated on the same completion port. Each port is opened
+	independently via a call to `TCP::listen()` which returns a reference to a `TCP::OpenPort`.
+	That reference is a stateful handle, but is opaque from the application's perspective.
+- Concurrent shutdown is now supported. One port can be shutdown, while others are still running,
+	by passing its reference to `TCP::close()`.
+
+
 - Spent some time building a minimally tested (and totally sketchy) family of allocators.
 	Inspired and guided by Bonwick's papers on the slab allocator.
-- Better worker synchronization with synchronization barriers.
-	Allows more controlled shutdown. Eliminates burden on workers
-	to be aware of concurrent shutdown and unnecessary logic in event loop.
-- Multi-phase shutdown with timeout for graceful connection termination.
-	Timeout is now per-worker and is based on the time from the last arrived packet.
-	It is based on a call to GetQueuedCompletionStatus() with a timeout set, so each
-	time a new completion packet is dequeued, the timeout resets.
 
 #### Future Revisions
-- Class "TCP". Unified interface for client and server functionality, with distinct
-	client read/write and server read/write ops and other internal ops to better utilize
-	completion queue. Applications will inherit from the server instead of the previous
-	template and delegate architecture.
-- Unified interface with distinct client read/write and server read/write ops, and other
-	internal ops to better utilize completion queue.
-- ~~Applications should delete packets on CLOSE error. Server should delete packets on ACCEPT error.
-	Packets currently not cleaned up in server, so will leak.~~ Packets will be under the exclusive
-	control of applications. Need to figure out how to make this work with AcceptEx, probably will
-	delegate responsibility to application.
-- Better error interface? Use struct and record source of internal errors.
+- Callbacks.dox needs to be updated or removed
+- Client operations: `TransmitFile(TF_DISCONNECT)` and `ConnectEx()`
 - Per-connection timeouts?
 - UDP
-- Thread load balancing? Use timing based QPC to determine when to add or remove threads.
-	Mutex contention &mdash; maybe associate new connections with mutexes
-	in a manner that reduces contention, some connections may be more frequent and demanding.
+- Timing facilities with `QueryPerformanceCounter()`

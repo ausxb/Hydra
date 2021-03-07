@@ -58,20 +58,12 @@ namespace Hydra
 
     static StaticInfo static_info;
 
-    class ServerException : public std::runtime_error
+	class SynchronousException : public std::runtime_error
 	{
 	public:
-		explicit ServerException(const char* msg, int err);
-		explicit ServerException(const std::string& msg, int err);
-		int error_code;
-	};
-
-	class ConnectionException : public std::runtime_error
-	{
-	public:
-		explicit ConnectionException(const char* msg, int err);
-		explicit ConnectionException(const std::string& msg, int err);
-		int error_code;
+		explicit SynchronousException(const char* msg, DWORD err);
+		explicit SynchronousException(const std::string& msg, DWORD err);
+		DWORD wsa_error;
 	};
 
 	int loadAcceptEx(SOCKET listening, LPFN_ACCEPTEX* ppfnAcceptEx);

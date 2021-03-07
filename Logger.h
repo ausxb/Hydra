@@ -1,24 +1,39 @@
 #pragma once
 
 #include <string>
-#include <iostream>
+#include <fstream>
 
 #include <Winsock2.h>
 #include <Ws2tcpip.h>
 
 namespace Hydra
 {
-	class Logger
+	class FileLogger
 	{
 	public:
-		static void init();
-		static void deinit();
-		static void dbg(const std::string& msg);
-		static void info(const std::string& msg);
-		static void warn(const std::string &msg);
-		static void err(const std::string &msg);
-		static std::string addrString(const LPSOCKADDR addr);
+		FileLogger(const std::string &path);
+		void dbg(const std::string &msg);
+		void info(const std::string &msg);
+		void warn(const std::string &msg);
+		void err(const std::string &msg);
 	private:
-		static CRITICAL_SECTION stream_lock;
+		std::ofstream logfile;
 	};
+
+	class ConsoleLogger
+	{
+	public:
+		ConsoleLogger();
+		~ConsoleLogger();
+		void dbg(const std::string &msg);
+		void info(const std::string &msg);
+		void warn(const std::string &msg);
+		void err(const std::string &msg);
+	private:
+		CRITICAL_SECTION stream_lock;
+	};
+
+	std::string addrString(const LPSOCKADDR addr);
+
+	static ConsoleLogger globalLog;
 }

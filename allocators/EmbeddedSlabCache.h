@@ -10,8 +10,8 @@ namespace Hydra
      * The EmbeddedSlabCache implements a single object cache for a
      * given buffer size, inspired by the design of the slab allocator
      * detailed in <em>The Slab Allocator: An Object-Caching Kernel Memory
-     * Allocator</em> [[Bonwick94](https://www.usenix.org/conference/
-     *usenix-summer-1994-technical-conference/
+     * Allocator</em> [[Bonwick94](https://www.usenix.org/conference/\
+     *usenix-summer-1994-technical-conference/\
      *slab-allocator-object-caching-kernel)]. Embedded in this context
      * refers both to the fact that metadata structures are embedded
      * in the slab memory and that the class is embedded as a member in
@@ -22,7 +22,7 @@ namespace Hydra
      * be less than an eighth of a page size, and all recordkeeping structures
      * are stored in the the slab itself. This class is designed for three
      * purposes:
-     *   1. An self-contained object cache for small sizes that benefits from
+     *   1. A self-contained object cache for small sizes that benefits from
      *      allocations touching data mostly on the same page when transitions
      *      between slabs are not required.
      *   2. An object cache for metadata structures that must be stored
@@ -74,8 +74,8 @@ namespace Hydra
         /*!
          * \brief Return a buffer to the cache.
          *
-         * \param[in] A pointer to the start of a buffer that was
-         *            returned from EmbeddedSlabCache::alloc().
+         * \param[in] obj A pointer to the start of a buffer that was
+         *                returned from EmbeddedSlabCache::alloc().
          */
         void dealloc(void *obj) noexcept;
 
@@ -134,7 +134,7 @@ namespace Hydra
         /*!
          * \brief Requests a new slab from the virtual page allocator.
          *
-         * <b>Must be called under lock, except during construction.<\b>
+         * <b>Must be called under lock, except during construction.</b>
          *
          * \return A pointer to the new SlabInfo if the slab
          *         was successfully created. NULL otherwise.

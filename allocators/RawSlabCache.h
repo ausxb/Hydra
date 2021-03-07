@@ -12,8 +12,8 @@ namespace Hydra
      * The RawSlabCache implements a single object cache for a
      * given buffer size, inspired by the design of the slab allocator
      * detailed in <em>The Slab Allocator: An Object-Caching Kernel Memory
-     * Allocator</em> [[Bonwick94](https://www.usenix.org/conference/
-     *usenix-summer-1994-technical-conference/
+     * Allocator</em> [[Bonwick94](https://www.usenix.org/conference/\
+     *usenix-summer-1994-technical-conference/\
      *slab-allocator-object-caching-kernel)].
      *
      * Unlike EmbeddedSlabCache, a RawSlabCache isn't self sufficient.
@@ -87,8 +87,8 @@ namespace Hydra
         /*!
          * \brief Return a buffer to the cache.
          *
-         * \param[in] A pointer to the start of a buffer that was
-         *            returned from EmbeddedSlabCache::alloc().
+         * \param[in] obj A pointer to the start of a buffer that was
+         *                returned from EmbeddedSlabCache::alloc().
          */
         void dealloc(void *obj) noexcept;
 
@@ -132,7 +132,7 @@ namespace Hydra
         /*!
          * \brief Requests a new slab from the virtual page allocator.
          *
-         * <b>Must be called under lock, except during construction.<\b>
+         * <b>Must be called under lock, except during construction.</b>
          *
          * \return A pointer to the new SlabInfo if the slab
          *         was successfully created. NULL otherwise.
